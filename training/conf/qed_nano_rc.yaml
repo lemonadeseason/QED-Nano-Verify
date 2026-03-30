@@ -14,7 +14,7 @@ defaults:
 seed: 42
 
 # Main model path for RC actor and regular actor
-model_path: Qwen/Qwen3-4B-Thinking-2507
+model_path: lm-provers/QED-Nano-SFT
 model_revision: main
 
 # Separate model for summarization (optional)
