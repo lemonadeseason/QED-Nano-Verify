@@ -1,0 +1,10 @@
+model: "gpt-5-2"
+api: custom
+api_key_env: AZURE_OPENAI_KEY
+base_url: https://msncompanioneu2.cognitiveservices.azure.com/openai/deployments/gpt-5-2/
+max_tokens: 16384
+read_cost: 0.0
+write_cost: 0.0
+concurrent_requests: 4
+human_readable_id: gpt-5.2
+date: "2026-04-23"
