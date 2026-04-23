@@ -210,4 +210,4 @@ __marimo__/
 *.out
 eval/agent_checkpoints/
 eval/outputs/
-eval/logs
+eval/logstraining/wandb/
