@@ -19,7 +19,7 @@ and this will not parse:
 """
 
 
-QED_DATASETS = ["lm-provers/Olympiads-RL"]
+QED_DATASETS = ["lm-provers/Olympiads-RL", "lm-provers/FineProofs-RL", "lm-provers/FineProofs-RL-test"]
 
 logger = logging.getLogger(__name__)
 

@@ -240,7 +240,7 @@ def run_actor_llm(
         "--host",
         "0.0.0.0",
         "--port",
-        str(8080 + local_idx),
+        str(8090 + local_idx),  # Use 8090+ to avoid JupyterLab on 8080
         "--seed",
         str(cfg.seed + actor_llm_idx),
         "--actor-llm-idx",
@@ -833,59 +833,107 @@ def start_llm_grader(name: str, vllm_kwargs: Any | None = None, namespace: str =
     gpu_memory_util = kwargs.get("gpu-memory-utilization", 0.85)
     if "/" in name:
         logger.info(f"Starting local LLM grader {name}...")
-        job_name = None
-        current_job_id = os.environ.get("SLURM_JOB_ID")
-        if current_job_id:
-            job_name = f"{current_job_id}-grader"
-        cmd = [
-            "sbatch",
-            "--parsable",
-            f"--nodes={num_nodes}"
+        
+        # Check if SLURM is available, otherwise start directly
+        import shutil
+        if shutil.which("sbatch") is not None:
+            # Original SLURM path
+            job_name = None
+            current_job_id = os.environ.get("SLURM_JOB_ID")
+            if current_job_id:
+                job_name = f"{current_job_id}-grader"
+            cmd = [
+                "sbatch",
+                "--parsable",
+                f"--nodes={num_nodes}"
+                ]
+            if job_name:
+                cmd.append(f"--job-name={job_name}")
+            cmd += [
+                "run_grader.slurm",
+                "--model",
+                name,
+                "--data-parallel-size",
+                str(data_parallel_size),
+                "--tensor-parallel-size",
+                str(tensor_parallel_size),
+                "--max-num-batched-tokens",
+                str(max_num_batched_tokens),
+                "--max-num-seqs",
+                str(max_num_seqs),
+                "--max-model-len",
+                str(max_model_len),
+                "--gpu-memory-utilization",
+                str(gpu_memory_util),
             ]
-        if job_name:
-            cmd.append(f"--job-name={job_name}")
-        cmd += [
-            "run_grader.slurm",
-            "--model",
-            name,
-            "--data-parallel-size",
-            str(data_parallel_size),
-            "--tensor-parallel-size",
-            str(tensor_parallel_size),
-            "--max-num-batched-tokens",
-            str(max_num_batched_tokens),
-            "--max-num-seqs",
-            str(max_num_seqs),
-            "--max-model-len",
-            str(max_model_len),
-            "--gpu-memory-utilization",
-            str(gpu_memory_util),
-        ]
-        submission = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        job_id = submission.stdout.strip().split(";")[0]
-        if not job_id:
-            raise RuntimeError("sbatch did not return a job id for the LLM grader submission")
-        logger.info(f"Submitted local LLM grader with Slurm job ID: {job_id}")
-        global _GRADER_JOB_ID
-        _GRADER_JOB_ID = job_id
-        _ensure_grader_cleanup_hooks()
-        nodes = _wait_for_slurm_nodes(job_id, timeout=timeout)
-        node_candidates = _expand_slurm_node_list(nodes)
-        if not node_candidates:
-            raise RuntimeError(f"Unable to determine head node from Slurm node list: {nodes}")
-        node = node_candidates[0]
-        os.environ["OPENAI_BASE_URL"] = f"http://{node}:8000/v1"
-        os.environ["OPENAI_API_KEY"] = "grader"
-        health_url = f"http://{node}:8000/health"
-        health_retries = int(os.environ.get("HEALTH_CHECK_RETRIES", "90"))
-        health_delay = int(os.environ.get("HEALTH_CHECK_DELAY", "10"))
-        _wait_for_vllm_health(health_url, retries=health_retries, delay=health_delay)
-        logger.info(
-            "LLM grader job %s scheduled on node(s): %s; OPENAI_BASE_URL=%s",
-            job_id,
-            nodes,
-            os.environ["OPENAI_BASE_URL"],
-        )
+            submission = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            job_id = submission.stdout.strip().split(";")[0]
+            if not job_id:
+                raise RuntimeError("sbatch did not return a job id for the LLM grader submission")
+            logger.info(f"Submitted local LLM grader with Slurm job ID: {job_id}")
+            global _GRADER_JOB_ID
+            _GRADER_JOB_ID = job_id
+            _ensure_grader_cleanup_hooks()
+            nodes = _wait_for_slurm_nodes(job_id, timeout=timeout)
+            node_candidates = _expand_slurm_node_list(nodes)
+            if not node_candidates:
+                raise RuntimeError(f"Unable to determine head node from Slurm node list: {nodes}")
+            node = node_candidates[0]
+            os.environ["OPENAI_BASE_URL"] = f"http://{node}:8000/v1"
+            os.environ["OPENAI_API_KEY"] = "grader"
+            health_url = f"http://{node}:8000/health"
+            health_retries = int(os.environ.get("HEALTH_CHECK_RETRIES", "90"))
+            health_delay = int(os.environ.get("HEALTH_CHECK_DELAY", "10"))
+            _wait_for_vllm_health(health_url, retries=health_retries, delay=health_delay)
+            logger.info(
+                "LLM grader job %s scheduled on node(s): %s; OPENAI_BASE_URL=%s",
+                job_id,
+                nodes,
+                os.environ["OPENAI_BASE_URL"],
+            )
+        else:
+            # No SLURM: start vLLM grader as a background subprocess
+            logger.info(f"No SLURM detected, starting LLM grader as background process...")
+            
+            # Find the last allocated GPU for grader (WorldMap assigns it)
+            grader_port = 8000
+            cmd = [
+                sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+                "--model", name,
+                "--host", "0.0.0.0",
+                "--port", str(grader_port),
+                "--tensor-parallel-size", str(tensor_parallel_size),
+                "--data-parallel-size", str(data_parallel_size),
+                "--max-num-batched-tokens", str(max_num_batched_tokens),
+                "--max-num-seqs", str(max_num_seqs),
+                "--max-model-len", str(max_model_len),
+                "--gpu-memory-utilization", str(gpu_memory_util),
+                "--dtype", "auto",
+                "--trust-remote-code",
+            ]
+            logger.info(f"Grader cmd: {' '.join(cmd)}")
+            
+            grader_log = open(os.path.join(os.environ.get("OUTPUT_DIR", "."), "grader.log"), "w")
+            grader_proc = subprocess.Popen(cmd, stdout=grader_log, stderr=subprocess.STDOUT)
+            
+            import atexit
+            def _cleanup_grader():
+                if grader_proc.poll() is None:
+                    grader_proc.terminate()
+                    grader_proc.wait(timeout=10)
+            atexit.register(_cleanup_grader)
+            
+            os.environ["OPENAI_BASE_URL"] = f"http://localhost:{grader_port}/v1"
+            os.environ["OPENAI_API_KEY"] = "grader"
+            health_url = f"http://localhost:{grader_port}/health"
+            health_retries = int(os.environ.get("HEALTH_CHECK_RETRIES", "120"))
+            health_delay = int(os.environ.get("HEALTH_CHECK_DELAY", "10"))
+            _wait_for_vllm_health(health_url, retries=health_retries, delay=health_delay)
+            logger.info(
+                "LLM grader started as PID %s; OPENAI_BASE_URL=%s",
+                grader_proc.pid,
+                os.environ["OPENAI_BASE_URL"],
+            )
     else:
         from huggingface_hub import get_inference_endpoint, get_token
         endpoint = get_inference_endpoint(name=name, namespace=namespace)
