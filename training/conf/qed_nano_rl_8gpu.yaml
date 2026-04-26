@@ -21,7 +21,7 @@ finetune:
   train_batch_size: 8  # reduced from 32 (4 GPUs vs 8)
   valid_batch_size: 8
   gradient_accumulation_passes: 64  # effective batch = 16 * 64 = 1024 (same as paper)
-  seq_length: 49920
+  seq_length: 46080  # reduced from 49920 to avoid OOM on 4-GPU finetune
   seq_parallel: 2
   learning_rate: 1.0e-6
   lr_scheduler_type: constant_with_warmup
@@ -40,7 +40,7 @@ finetune:
 
 llm:
   parameters:
-    max_tokens: 49152
+    max_tokens: 45312  # seq_length - prompt (~768 tokens)
     temperature: 0.8
   reasoning_delimiters: ["</think>"]
   wandb_table:
