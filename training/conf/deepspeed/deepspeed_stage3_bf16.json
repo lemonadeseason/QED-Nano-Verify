@@ -5,7 +5,8 @@
     "zero_optimization": {
         "stage": 3,
         "offload_optimizer": {
-            "device": "none"
+            "device": "cpu",
+            "pin_memory": true
         },
         "offload_param": {
             "device": "none"
