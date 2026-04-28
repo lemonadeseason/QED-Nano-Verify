@@ -404,10 +404,16 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     ]
     logger.info(f"Running actor with command: {' '.join(cmd)}")
     save_command(exp_dir / "actor", cmd)
-    yield _popen(
-        cmd,
-        env=dict(os.environ),
-    )
+    actor_dir = exp_dir / "actor"
+    os.makedirs(actor_dir, exist_ok=True)
+    log_file_path = str(actor_dir / "run_actor.log")
+    with open(log_file_path, "a") as log_file:
+        yield _popen(
+            cmd,
+            env=dict(os.environ),
+            stdout=log_file,
+            stderr=log_file,
+        )
 
 
 def run_environment(cfg: DictConfig, job: Job):

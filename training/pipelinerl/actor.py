@@ -824,6 +824,9 @@ class ActorLoop:
         published_samples = 0
         submitted_groups = 0
         finished_groups = 0
+
+        # Early-warning: crash fast if all rewards are 0 in the first few groups
+        reward_watchdog = _RewardWatchdog() if self.is_training else None
         
         # Check if dataset is an iterator/generator or a list
         # Simple check: lists have __len__, generators/iterators don't
@@ -1033,6 +1036,10 @@ class ActorLoop:
                 self.update_stats(rollout_results=rollout_results)
                 self.log_verifier_metrics_for_group(rollout_results)
 
+                # Early-warning: check for reward anomalies in the first few groups
+                if reward_watchdog is not None:
+                    reward_watchdog.observe(rollout_results)
+
                 finished_groups += 1
                 
                 time_to_publish_train_stats = (
@@ -1102,6 +1109,153 @@ class ActorLoop:
             wandb.log({f"actor/{k}": v for k, v in stats.items()})
         stats_writer.write(stats)
         self.init_stats()  # Reset stats for the next iteration
+
+
+# ── Pre-flight & early-warning helpers ────────────────────────────
+
+def _preflight_grader_check(cfg: DictConfig, train_dataset: list | None):
+    """
+    Before burning GPU-hours, verify the LLM grader returns a non-zero score
+    on a known-good proof.  Runs **synchronously** and crashes fast on failure.
+    """
+    # Only meaningful when the dataset uses proof-based grading
+    has_proof_problems = train_dataset and any("schema" in p for p in train_dataset[:20])
+    if not has_proof_problems:
+        logger.info("[preflight] No proof-based problems detected, skipping grader check")
+        return
+
+    logger.info("[preflight] ===== Grader sanity check starting =====")
+    import asyncio
+    from pipelinerl.domains.math.verifier_api import verify_proof, parse_schema, _is_azure_grader
+
+    grader_backend = "Azure GPT-5.2" if _is_azure_grader() else "local vLLM"
+    logger.info(f"[preflight] Grader backend: {grader_backend}")
+
+    # Pick a real problem from the training set (with schema)
+    sample_problem = next((p for p in train_dataset if "schema" in p), None)
+    if sample_problem is None:
+        logger.warning("[preflight] Could not find a proof problem to test")
+        return
+
+    problem_text = sample_problem.get("original_problem", sample_problem.get("task", ""))
+    ref_solution = sample_problem.get("answer", "")
+    schema_text = parse_schema(sample_problem["schema"])
+
+    # We need a "generation" that should get a non-zero score.
+    # If the dataset has a reference solution, use it (should score ~7).
+    # If not (e.g. FineProofs-RL has no solution column), use a synthetic
+    # trivially-correct proof so we can at least verify the grader pipeline
+    # (API call → response parsing → score extraction) works end-to-end.
+    if ref_solution.strip():
+        generation = ref_solution
+    else:
+        generation = (
+            "We prove the claim by a straightforward argument. "
+            "The key observation follows directly from the problem statement. "
+            "Therefore the result holds. QED."
+        )
+        logger.info("[preflight] No reference solution in dataset; using synthetic proof "
+                     "(we only check that the grader returns *any* parseable score)")
+    model_name = getattr(cfg.llm_grader, "name", None)
+    if model_name and "/" not in model_name:
+        model_name = os.getenv("HF_ENDPOINT_REPO", model_name)
+
+    try:
+        result = asyncio.run(
+            verify_proof(
+                problem=problem_text,
+                ref_solution=ref_solution,
+                schema=schema_text,
+                generation=generation,
+                prompt_name=getattr(cfg.llm_grader, "prompt_name", None),
+                model=model_name,
+                sampling_kwargs=getattr(cfg.llm_grader, "sampling_kwargs", None),
+                log_wandb_metrics=False,
+                timeout_seconds=300,
+            )
+        )
+    except Exception as e:
+        logger.error(f"[preflight] Grader call FAILED with exception: {e}")
+        raise RuntimeError(
+            f"Pre-flight grader check failed: {e}\n"
+            "Fix the grader configuration before starting training."
+        ) from e
+
+    logger.info(
+        f"[preflight] Grader returned score={result.score}/7, metrics={result.metrics}"
+    )
+
+    # Check for failures
+    has_ref_solution = bool(ref_solution.strip())
+    failure_metrics = {k: v for k, v in result.metrics.items() if "failure" in k or "no_score" in k}
+
+    if failure_metrics:
+        # Score parsing failed — grader is broken
+        raise RuntimeError(
+            f"Pre-flight grader check FAILED: grader returned failure metrics.\n"
+            f"Failure metrics: {failure_metrics}\n"
+            f"This means score parsing is broken — all training rewards would be 0.\n"
+            f"Grader backend: {grader_backend}"
+        )
+
+    if has_ref_solution and result.score == 0:
+        # Reference solution scored 0 — something is very wrong
+        raise RuntimeError(
+            f"Pre-flight grader check FAILED: score=0 when grading the reference solution.\n"
+            f"This means the grader is broken — all training rewards would be 0.\n"
+            f"Grader backend: {grader_backend}"
+        )
+
+    logger.info("[preflight] ===== Grader sanity check PASSED =====")
+
+
+class _RewardWatchdog:
+    """
+    Monitors rewards for the first N groups and crashes if they are all zero
+    (or show other anomalies), before wasting hours of compute.
+    """
+
+    # How many groups to observe before making a decision
+    WARMUP_GROUPS = 5
+    # Minimum non-zero fraction expected (FineProofs-RL has ~25-30% success)
+    MIN_NONZERO_FRAC = 0.0  # 0 means: at least *one* non-zero is enough
+
+    def __init__(self):
+        self._rewards: list[float] = []
+        self._groups_seen = 0
+        self._armed = True  # disarm after the check passes
+
+    def observe(self, rollout_results: list[RolloutResult]):
+        if not self._armed:
+            return
+        for r in rollout_results:
+            for t in r.training_texts:
+                self._rewards.append(t.reward)
+        self._groups_seen += 1
+        if self._groups_seen >= self.WARMUP_GROUPS:
+            self._check_and_disarm()
+
+    def _check_and_disarm(self):
+        self._armed = False
+        total = len(self._rewards)
+        if total == 0:
+            logger.warning("[reward-watchdog] No rewards collected after %d groups", self._groups_seen)
+            return
+
+        nonzero = sum(1 for r in self._rewards if r != 0.0)
+        frac = nonzero / total
+        logger.info(
+            f"[reward-watchdog] After {self._groups_seen} groups: "
+            f"{total} rollouts, {nonzero} non-zero rewards ({frac:.1%})"
+        )
+
+        if nonzero == 0:
+            raise RuntimeError(
+                f"REWARD ANOMALY: All {total} rewards are 0.0 after {self._groups_seen} groups!\n"
+                "This almost certainly means the grader is broken.\n"
+                "Stopping early to avoid wasting compute.\n"
+                "Check actor logs for '[verify_proof]' messages."
+            )
 
 
 def run_actor_loop(cfg: DictConfig):
@@ -1189,6 +1343,11 @@ def run_actor_loop(cfg: DictConfig):
 
     wait_for_inference_servers(llm_urls)
     wait_for_environments(cfg)
+
+    # ── Pre-flight grader sanity check ────────────────────────────
+    # Catch grader misconfigurations *before* burning GPU-hours.
+    _preflight_grader_check(cfg, train_dataset)
+
     trainer_state = TrainerState(exp_path)
     if cfg.debug.mode:
         trainer_state.debug_mode_init()

@@ -523,13 +523,45 @@ async def verify_proof(
                     runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
             # Extract output text from either API format
             if use_azure:
-                output_text = response.choices[0].message.content or ""
+                msg = response.choices[0].message
+                output_text = msg.content or ""
+                # GPT-5.2 is a reasoning model: content may be None, with
+                # the actual output in reasoning_content instead.
+                if not output_text:
+                    rc = getattr(msg, "reasoning_content", None) or ""
+                    if rc:
+                        output_text = rc
+                        logger.info(f"[verify_proof] message.content was empty; using reasoning_content ({len(rc)} chars)")
+                # Some Azure API versions nest output in 'reasoning' attr
+                if not output_text:
+                    reasoning_attr = getattr(msg, "reasoning", None)
+                    if reasoning_attr:
+                        output_text = str(reasoning_attr)
+                        logger.info(f"[verify_proof] Fell back to message.reasoning ({len(output_text)} chars)")
+                logger.info(
+                    f"[verify_proof] Azure response: content_is_none={msg.content is None}, "
+                    f"output_text_len={len(output_text)}, first_200={output_text[:200]!r}"
+                )
+                # Azure sometimes returns HTTP 200 but empty content during
+                # transient outages.  Treat this as a retryable error.
+                if not output_text:
+                    wait_time = retry_backoff[min(attempt - 1, len(retry_backoff) - 1)]
+                    attempt_failure_causes.append("empty_response")
+                    if attempt < max_retries:
+                        num_retries += 1
+                    logger.warning(
+                        f"[verify_proof] Azure returned 200 but output_text is empty "
+                        f"(attempt {attempt}/{max_retries}), retrying in {wait_time}s"
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
             else:
                 output_text = getattr(response, "output_text", None) or ""
             # Try both <score> and <points> tag formats
-            match = re.search(r"<score>(\d+)</score>", output_text) or re.search(r"<points>\s*(\d+)", output_text)
+            match = re.search(r"<score>\s*(\d+)\s*</score>", output_text) or re.search(r"<points>\s*(\d+)", output_text)
             if match:
                 score = int(match.group(1))
+                logger.info(f"[verify_proof] Parsed score={score} from output")
                 table_entry = None
                 if should_collect_table_entry:
                     reasoning_text = _extract_reasoning_from_response(response)
@@ -563,6 +595,10 @@ async def verify_proof(
                     success=False,
                     failure_causes=["no_score_tag"],
                     num_retries=num_retries,
+                )
+                logger.warning(
+                    f"[verify_proof] No <score> tag found (attempt {attempt}) — returning 0. "
+                    f"output_text_len={len(output_text)}, first_500={output_text[:500]!r}"
                 )
                 print(f"[verify_proof]: {_timestamp()} - No <score> tag found (attempt {attempt}) — returning 0")
                 return ProofVerificationResult(
