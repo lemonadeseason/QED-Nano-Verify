@@ -296,6 +296,13 @@ def parse_schema(schema: Any) -> str:
     return "\n\n".join(sections)
 
 _openai_client = None
+_azure_grader_client = None
+
+
+def _is_azure_grader() -> bool:
+    """Check if Azure GPT-5.2 grader is configured via environment variables."""
+    return bool(os.getenv("AZURE_GRADER_ENDPOINT"))
+
 
 @dataclass
 class ProofVerificationResult:
@@ -370,20 +377,38 @@ def _build_rollout_metrics(success: bool, failure_causes: list[str], num_retries
 
 def get_openai_client():
     """
-    Lazily initialize and cache a OpenAI API client using OpenAI SDK interface.
-    Requires OPENAI_API_KEY to be set in environment.
+    Lazily initialize and cache an API client.
+    If AZURE_GRADER_ENDPOINT is set, returns an AzureOpenAI client for GPT-5.2.
+    Otherwise, returns a standard OpenAI client for local vLLM.
     """
-    global _openai_client
-    if _openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL")
-        if not api_key or not base_url:
-            raise RuntimeError("Missing OPENAI_API_KEY or OPENAI_BASE_URL environment variable")
-        _openai_client = openai.OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-    return _openai_client 
+    if _is_azure_grader():
+        global _azure_grader_client
+        if _azure_grader_client is None:
+            from openai import AzureOpenAI
+            endpoint = os.getenv("AZURE_GRADER_ENDPOINT")
+            api_key = os.getenv("AZURE_GRADER_KEY")
+            api_version = os.getenv("AZURE_GRADER_API_VERSION", "2024-12-01-preview")
+            if not api_key:
+                raise RuntimeError("AZURE_GRADER_KEY must be set when using AZURE_GRADER_ENDPOINT")
+            _azure_grader_client = AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version=api_version,
+            )
+            print(f"[get_openai_client] Using Azure GPT-5.2 grader at {endpoint}")
+        return _azure_grader_client
+    else:
+        global _openai_client
+        if _openai_client is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            if not api_key or not base_url:
+                raise RuntimeError("Missing OPENAI_API_KEY or OPENAI_BASE_URL environment variable")
+            _openai_client = openai.OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+            )
+        return _openai_client
 
 # =================================================
 # Proof evaluator: calls OpenAI-compatible endpoint
@@ -440,17 +465,36 @@ async def verify_proof(
     api_kwargs = dict(sampling_kwargs) if sampling_kwargs else {}
 
     loop = asyncio.get_event_loop()
+    use_azure = _is_azure_grader()
+    azure_model = os.getenv("AZURE_GRADER_DEPLOYMENT", "gpt-5-2") if use_azure else None
 
-    # TODO: add support for chat completions API for other graders
     async def _call_openai():
-        return await loop.run_in_executor(
-            None,
-            lambda: client.responses.create(
-                model=model,
-                input=prompt_text,
-                **api_kwargs,
-            ),
-        )
+        if use_azure:
+            # Azure Chat Completions API (GPT-5.2)
+            chat_kwargs = {}
+            if "max_output_tokens" in api_kwargs:
+                chat_kwargs["max_completion_tokens"] = api_kwargs["max_output_tokens"]
+            if "temperature" in api_kwargs:
+                # GPT-5.2 is a reasoning model, temperature is fixed
+                pass
+            return await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=azure_model,
+                    messages=[{"role": "user", "content": prompt_text}],
+                    **chat_kwargs,
+                ),
+            )
+        else:
+            # Local vLLM Responses API (gpt-oss-20b)
+            return await loop.run_in_executor(
+                None,
+                lambda: client.responses.create(
+                    model=model,
+                    input=prompt_text,
+                    **api_kwargs,
+                ),
+            )
 
     attempt_failure_causes: list[str] = []
     num_retries = 0
@@ -465,20 +509,25 @@ async def verify_proof(
             output_tokens = None
             input_tokens = None
             if usage is not None:
-                output_tokens = getattr(usage, "output_tokens", None)
-                input_tokens = getattr(usage, "input_tokens", None)
+                output_tokens = getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None)
+                input_tokens = getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
                 if output_tokens is None and isinstance(usage, dict):
-                    output_tokens = usage.get("output_tokens")
+                    output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
                 if input_tokens is None and isinstance(usage, dict):
-                    input_tokens = usage.get("input_tokens")
+                    input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
             if collect_metrics:
                 runtime_metrics = {"verifier/runtime/latency_per_request": latency_seconds}
                 if output_tokens is not None:
                     runtime_metrics["verifier/runtime/output_tokens"] = output_tokens
                 if input_tokens is not None:
                     runtime_metrics["verifier/runtime/input_tokens"] = input_tokens
-            output_text = getattr(response, "output_text", None) or ""
-            match = re.search(r"<score>(\d+)</score>", output_text)
+            # Extract output text from either API format
+            if use_azure:
+                output_text = response.choices[0].message.content or ""
+            else:
+                output_text = getattr(response, "output_text", None) or ""
+            # Try both <score> and <points> tag formats
+            match = re.search(r"<score>(\d+)</score>", output_text) or re.search(r"<points>\s*(\d+)", output_text)
             if match:
                 score = int(match.group(1))
                 table_entry = None

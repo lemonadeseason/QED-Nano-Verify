@@ -1,8 +1,8 @@
 # ---------------------
 # Config for 8-GPU (1 node × 8 A100 80GB) RL training
-#   actor: 3 GPUs (generate rollouts with QED-Nano-SFT)
-#   grader: 1 GPU (gpt-oss-20b local)
-#   finetuning: 4 GPUs (DeepSpeed ZeRO-3)
+#   actor: 6 GPUs (generate rollouts with QED-Nano-SFT)
+#   grader: Azure GPT-5.2 endpoint (no local GPU needed)
+#   finetuning: 2 GPUs (DeepSpeed ZeRO-3)
 # ---------------------
 defaults:
     - base
@@ -122,10 +122,10 @@ vllm_config:
     pipeline-parallel-size: 1
     generation-config: vllm
 
-# 7 GPU allocation: 5 actor + 2 finetune (GPU 7 reserved for grader server)
+# 8 GPU allocation: 6 actor + 2 finetune (grader is Azure GPT-5.2, no local GPU)
 world:
   replicas: 1
-  actor_fraction: 5
+  actor_fraction: 6
   preprocessor_fraction: 0
   finetune_fraction: 2
   env_replicas: 1
