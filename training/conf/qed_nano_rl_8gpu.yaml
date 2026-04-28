@@ -18,11 +18,11 @@ preprocess:
 
 finetune:
   attempts: 16  # same as paper
-  train_batch_size: 4  # reduced from 8 for 1-GPU finetune
+  train_batch_size: 4
   valid_batch_size: 4
-  gradient_accumulation_passes: 128  # doubled to keep samples/step = 4*128 = 512
-  seq_length: 46080  # reduced from 49920 to avoid OOM on 4-GPU finetune
-  seq_parallel: 1  # 1 GPU cannot do seq parallel
+  gradient_accumulation_passes: 128  # samples/step = 4*128 = 512
+  seq_length: 46080  # reduced from 49920 to avoid OOM
+  seq_parallel: 2  # split sequence across 2 finetune GPUs
   learning_rate: 1.0e-6
   lr_scheduler_type: constant_with_warmup
   num_warmup_steps: 0
@@ -122,12 +122,12 @@ vllm_config:
     pipeline-parallel-size: 1
     generation-config: vllm
 
-# 7 GPU allocation: 6 actor + 1 finetune (GPU 7 reserved for grader server)
+# 7 GPU allocation: 5 actor + 2 finetune (GPU 7 reserved for grader server)
 world:
   replicas: 1
-  actor_fraction: 6
+  actor_fraction: 5
   preprocessor_fraction: 0
-  finetune_fraction: 1
+  finetune_fraction: 2
   env_replicas: 1
   actor_group_port: 9000
   environment_start_port: 7777
