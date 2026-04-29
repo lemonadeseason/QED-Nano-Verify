@@ -1215,8 +1215,11 @@ class _RewardWatchdog:
     (or show other anomalies), before wasting hours of compute.
     """
 
-    # How many groups to observe before making a decision
-    WARMUP_GROUPS = 5
+    # How many groups to observe before making a decision.
+    # IMO-level proofs are very hard — consecutive zero-reward groups are normal.
+    # With 16 rollouts/group, 20 groups = 320 rollouts.
+    # At ~30% baseline success rate, P(320 consecutive zeros) ≈ 0.7^320 ≈ 0.
+    WARMUP_GROUPS = 20
     # Minimum non-zero fraction expected (FineProofs-RL has ~25-30% success)
     MIN_NONZERO_FRAC = 0.0  # 0 means: at least *one* non-zero is enough
 

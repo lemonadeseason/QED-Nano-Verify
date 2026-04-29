@@ -319,10 +319,18 @@ def _extract_reasoning_from_response(response: Any) -> str:
     For reasoning models, this includes items with type="reasoning" that have
     a `content` list of text objects.
 
+    For Chat Completions API (Azure), reasoning may be in `reasoning_content`.
+
     See: https://platform.openai.com/docs/api-reference/responses/object
     """
+    # Chat Completions API (Azure GPT-5.2)
+    if hasattr(response, "choices"):
+        msg = response.choices[0].message
+        return getattr(msg, "reasoning_content", None) or ""
+
+    # Responses API (local vLLM)
     reasoning_chunks: list[str] = []
-    for item in response.output or []:
+    for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) == "reasoning":
             for content_item in getattr(item, "content", []) or []:
                 text = getattr(content_item, "text", None)
