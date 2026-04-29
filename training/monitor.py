@@ -133,6 +133,20 @@ def analyze_grader(run_dir):
     result["total_grading_calls"] = len(recv_times)
     result["errors"] = errors
 
+    # Score distribution from info.log
+    info_log = Path(run_dir) / "actor/info.log"
+    if info_log.exists():
+        score_counts = {}
+        for line in info_log.open():
+            m = re.search(r'Parsed score=(\d+)', line)
+            if m:
+                s = int(m.group(1))
+                score_counts[s] = score_counts.get(s, 0) + 1
+        if score_counts:
+            result["score_distribution"] = score_counts
+            result["total_scored"] = sum(score_counts.values())
+            result["nonzero_scored"] = sum(v for k, v in score_counts.items() if k > 0)
+
     if latencies:
         result["avg_latency_sec"] = sum(latencies) / len(latencies)
         result["min_latency_sec"] = min(latencies)
@@ -333,6 +347,12 @@ def print_report(run_dir):
     if g and g.get("total_grading_calls", 0) > 0:
         print(f"\n  Grader (Azure GPT-5.2):")
         print(f"    Total calls: {g['total_grading_calls']} ({g.get('errors', 0)} errors)")
+        if g.get("score_distribution"):
+            dist = g["score_distribution"]
+            dist_str = ", ".join(f"s{k}={v}" for k, v in sorted(dist.items()))
+            nz = g.get('nonzero_scored', 0)
+            total = g.get('total_scored', 0)
+            print(f"    Scores: {dist_str}  ({nz}/{total} non-zero = {nz/total*100:.0f}%)" if total > 0 else "")
         if g.get("avg_latency_sec"):
             print(f"    Latency: avg {g['avg_latency_sec']:.1f}s, median {g['median_latency_sec']:.1f}s, "
                   f"p90 {g['p90_latency_sec']:.1f}s, range [{g['min_latency_sec']:.1f}s, {g['max_latency_sec']:.1f}s]")
@@ -380,16 +400,18 @@ def print_report(run_dir):
     steps = f.get('completed_steps', 0)
     rate = r.get('rollout_rate_per_min', 0)
     sample_rate = p.get('sample_rate_per_min', 0)
+    graded = g.get('total_grading_calls', 0)
 
     print(f"    Rollouts → Grader → Preprocess → Finetune")
-    print(f"    {finished:>6}       →  {samples:>4}/512    →  Step {steps}")
+    print(f"    {finished:>6}    {graded:>5}    {samples:>4}/512      Step {steps}")
 
     if sample_rate > 0 and samples < 512:
         eta = (512 - samples) / sample_rate
-        print(f"    ETA to first finetune step: ~{eta:.0f} min ({eta/60:.1f}h)")
-    elif rate > 0 and samples == 0:
-        # Estimate based on rollout rate (grader not yet started)
-        print(f"    Grading not yet started, rollout rate: {rate:.1f}/min")
+        print(f"    ETA to next finetune step: ~{eta:.0f} min ({eta/60:.1f}h)")
+    elif graded > 0 and samples == 0:
+        print(f"    Grading active ({graded} scored), waiting for groups to complete (need 16 rollouts/group)")
+    elif rate > 0 and graded == 0:
+        print(f"    Rollouts generating, grading not yet started")
 
     print(f"{'='*70}\n")
 
