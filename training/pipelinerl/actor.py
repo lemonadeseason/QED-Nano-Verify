@@ -942,6 +942,24 @@ class ActorLoop:
                 assert isinstance(rollout_results[0], RolloutResult)
                 group_samples = sum(len(r.training_texts) for r in rollout_results)
 
+                # ---- Reward watchdog ----
+                # Check if early groups all have reward=0 (indicates broken grader)
+                if self.is_training and finished_groups < 5:
+                    group_rewards = [r.reward for r in rollout_results if hasattr(r, 'reward')]
+                    if group_rewards and all(rw == 0.0 for rw in group_rewards):
+                        if not hasattr(self, '_zero_reward_groups'):
+                            self._zero_reward_groups = 0
+                        self._zero_reward_groups += 1
+                        logger.warning(
+                            f"REWARD WATCHDOG: Group {finished_groups+1} has all-zero rewards "
+                            f"({self._zero_reward_groups} consecutive zero-reward groups)"
+                        )
+                        if self._zero_reward_groups >= 5:
+                            raise RuntimeError(
+                                "REWARD WATCHDOG: First 5 groups ALL have reward=0. "
+                                "Grader is likely broken. Aborting to avoid wasting GPU hours."
+                            )
+
                 published_samples += group_samples
                 samples_in_queue = self.result_queue.qsize() * attempts
                 all_text_dumps = []
