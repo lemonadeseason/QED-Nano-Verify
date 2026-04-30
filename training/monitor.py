@@ -387,6 +387,14 @@ def print_report(run_dir):
                   f"waiting: {f['latest_time_waiting']:.0f}s ({f['latest_time_waiting']/3600:.1f}h)")
             if f.get('reward_history'):
                 print(f"    Reward history: {' -> '.join(f'{x:.3f}' for x in f['reward_history'])}")
+            if f.get('all_steps'):
+                loss_hist = [s['loss'] for s in f['all_steps']]
+                norm_hist = [s['grad_norm'] for s in f['all_steps']]
+                step_times = [s['sec_per_step'] for s in f['all_steps']]
+                print(f"    Loss history:   {' -> '.join(f'{x:.1f}' for x in loss_hist)}")
+                print(f"    Norm history:   {' -> '.join(f'{x:.3f}' for x in norm_hist)}")
+                avg_step = sum(step_times) / len(step_times)
+                print(f"    Avg step time:  {avg_step:.0f}s ({avg_step/3600:.2f}h)")
             if f.get('current_step'):
                 print(f"    Current: step {f['current_step']} in progress ({f.get('current_passes', 0)} passes done)")
         else:
